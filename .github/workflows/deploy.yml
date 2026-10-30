@@ -1,0 +1,173 @@
+name: Deploy fuseagencia to VPS
+
+# Push na main = imagem no GHCR (por digest) -> deploy na VPS -> verificação pública.
+# O deploy acontece SÓ por aqui; nada é feito direto na VPS.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Deploys em fila, nunca cancelados no meio.
+concurrency:
+  group: deploy-fuseagencia
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  VPS_HOST: 72.60.10.112
+  VPS_APP_DIR: /root/fuseagencia/deploy
+  # Impressão SHA256 da chave de host ed25519 da VPS (conferida também de dentro da VPS).
+  VPS_HOST_FINGERPRINT: SHA256:6ZU1oyYcSKKrodyE2uYKme3ciSkCWFxfniTKCGn7NW8
+  PUBLIC_URL: https://fuseagencia.com.br
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.out.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - id: image
+        name: Nome da imagem no GHCR
+        run: echo "name=ghcr.io/$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/fuseagencia-web" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          cache-from: type=gha,scope=fuseagencia-web
+          cache-to: type=gha,mode=max,scope=fuseagencia-web
+          tags: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+      - id: out
+        name: Referência imutável (repositório@digest)
+        run: echo "image=${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      FUSEAGENCIA_WEB_IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Conferir imagem por digest
+        run: |
+          set -euo pipefail
+          case "$FUSEAGENCIA_WEB_IMAGE" in *@sha256:*) echo "ok: $FUSEAGENCIA_WEB_IMAGE" ;; *) echo "ERRO: imagem sem digest"; exit 1 ;; esac
+
+      - name: Chave de host fixada (impressão SHA256)
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          install -m 600 .github/vps_known_hosts ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk -v fp="$VPS_HOST_FINGERPRINT" '$2 == fp { found=1 } END { exit !found }' \
+            || { echo "ERRO: .github/vps_known_hosts não tem a impressão esperada $VPS_HOST_FINGERPRINT"; exit 1; }
+
+      - name: Chave SSH de deploy
+        env:
+          DEPLOY_KEY: ${{ secrets.FUSEAGENCIA_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$DEPLOY_KEY" ] || { echo "Secret FUSEAGENCIA_DEPLOY_SSH_KEY ausente"; exit 1; }
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/fuseagencia_deploy
+          chmod 600 ~/.ssh/fuseagencia_deploy
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName $VPS_HOST
+            User root
+            IdentityFile ~/.ssh/fuseagencia_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            PasswordAuthentication no
+            BatchMode yes
+            ConnectTimeout 30
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # Uma tentativa só. A Hostinger filtra por reputação algumas faixas de IP dos runners;
+      # se falhar, "Re-run all jobs" pega outro runner (outro IP). Nada foi alterado na VPS.
+      - name: Primeiro contato com a VPS
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          if ! ssh vps "mkdir -p '$VPS_APP_DIR'"; then
+            echo "Este runner não alcança a porta 22 da VPS."
+            echo "IP de saída: $(curl -s --max-time 10 ifconfig.me || echo indisponível)"
+            echo "Solução: 'Re-run all jobs'. A versão no ar não foi afetada."
+            exit 1
+          fi
+
+      - name: Enviar a pasta deploy/
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq rsync >/dev/null
+          rsync -rlptz --delete --no-owner --no-group \
+            --exclude='images.env' --exclude='images.env.*' \
+            -e ssh deploy/ "vps:$VPS_APP_DIR/"
+
+      - name: Executar o deploy na VPS
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ssh vps bash -s <<EOF
+          set -euo pipefail
+          printf '%s' '${GHCR_TOKEN}' | docker login ghcr.io --username '${GHCR_USERNAME}' --password-stdin >/dev/null
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          chmod +x '${VPS_APP_DIR}/deploy.sh' '${VPS_APP_DIR}/setup-host.sh'
+          APP_DIR='${VPS_APP_DIR}' FUSEAGENCIA_WEB_IMAGE='${FUSEAGENCIA_WEB_IMAGE}' '${VPS_APP_DIR}/deploy.sh'
+          EOF
+
+  verify-public:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Enquanto DNS/HTTPS não estiverem prontos, só AVISA. Depois, qualquer falha reprova.
+      - name: Testar o domínio público
+        run: |
+          set -uo pipefail
+          pendente() {
+            echo "::warning title=Domínio ainda não pronto::$1"
+            echo "### Deploy OK na VPS; domínio público pendente" >> "$GITHUB_STEP_SUMMARY"
+            echo "$1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          faltando=""
+          for host in fuseagencia.com.br www.fuseagencia.com.br; do
+            ip=$(getent ahostsv4 "$host" | awk '{print $1}' | head -1 || true)
+            echo "DNS $host -> ${ip:-sem registro}"
+            [ "$ip" = "${{ env.VPS_HOST }}" ] || faltando="$faltando $host(${ip:-sem registro})"
+          done
+          [ -z "$faltando" ] || pendente "DNS ainda não aponta para ${{ env.VPS_HOST }}:$faltando."
+          curl -sS -o /dev/null --max-time 15 "$PUBLIC_URL/" 2>/dev/null \
+            || pendente "DNS OK, mas HTTPS ainda não responde. Rode o workflow 'Configurar nginx do host e HTTPS (manual)'."
+
+          ok=0
+          curl -fsS --max-time 10 "$PUBLIC_URL/" | grep -q "FUSE AGENCIA LTDA" && echo "OK  $PUBLIC_URL/" || { echo "::error::$PUBLIC_URL/ sem o conteúdo esperado"; ok=1; }
+          curl -fsS --max-time 10 "$PUBLIC_URL/privacidade.html" | grep -q "Política de" && echo "OK  privacidade" || { echo "::error::privacidade.html falhou"; ok=1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://www.fuseagencia.com.br/")
+          [ "$code" = "301" ] && echo "OK  www -> apex (301)" || { echo "::error::www respondeu $code (esperado 301)"; ok=1; }
+          [ "$ok" = 0 ] && echo "### Domínio público OK" >> "$GITHUB_STEP_SUMMARY"
+          exit $ok

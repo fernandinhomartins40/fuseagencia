@@ -1,0 +1,72 @@
+name: Configurar nginx do host e HTTPS (manual)
+
+# Rodar UMA vez, depois que o DNS de fuseagencia.com.br e www apontar para a VPS
+# e o primeiro deploy tiver subido o contêiner em 127.0.0.1:3700.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-fuseagencia
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  VPS_HOST: 72.60.10.112
+  VPS_APP_DIR: /root/fuseagencia/deploy
+  VPS_HOST_FINGERPRINT: SHA256:6ZU1oyYcSKKrodyE2uYKme3ciSkCWFxfniTKCGn7NW8
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Chave de host fixada e chave de deploy
+        env:
+          DEPLOY_KEY: ${{ secrets.FUSEAGENCIA_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          install -m 600 .github/vps_known_hosts ~/.ssh/known_hosts
+          ssh-keygen -lf ~/.ssh/known_hosts -E sha256 | awk -v fp="$VPS_HOST_FINGERPRINT" '$2 == fp { found=1 } END { exit !found }' \
+            || { echo "ERRO: impressão da chave de host não confere"; exit 1; }
+          [ -n "$DEPLOY_KEY" ] || { echo "Secret FUSEAGENCIA_DEPLOY_SSH_KEY ausente"; exit 1; }
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/fuseagencia_deploy
+          chmod 600 ~/.ssh/fuseagencia_deploy
+          cat > ~/.ssh/config <<EOF
+          Host vps
+            HostName $VPS_HOST
+            User root
+            IdentityFile ~/.ssh/fuseagencia_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            PasswordAuthentication no
+            BatchMode yes
+            ConnectTimeout 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Enviar a pasta deploy/
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq rsync >/dev/null
+          ssh vps "mkdir -p '$VPS_APP_DIR'"
+          rsync -rlptz --no-owner --no-group \
+            --exclude='images.env' --exclude='images.env.*' \
+            -e ssh deploy/ "vps:$VPS_APP_DIR/"
+
+      - name: Instalar site no nginx do host e emitir certificado
+        run: |
+          set -euo pipefail
+          ssh vps "chmod +x '$VPS_APP_DIR/setup-host.sh' && APP_DIR='$VPS_APP_DIR' '$VPS_APP_DIR/setup-host.sh'"
+
+      - name: Conferir HTTPS
+        run: |
+          set -euo pipefail
+          sleep 5
+          curl -fsS --max-time 15 https://fuseagencia.com.br/ | grep -q "FUSE AGENCIA LTDA"
+          echo "OK: https://fuseagencia.com.br" >> "$GITHUB_STEP_SUMMARY"

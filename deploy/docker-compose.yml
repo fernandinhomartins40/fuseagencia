@@ -1,0 +1,22 @@
+# Compose da FUSE Agência na VPS compartilhada (projeto "fuseagencia").
+# Escuta só em 127.0.0.1:3700; o nginx do host faz o HTTPS de fuseagencia.com.br.
+name: fuseagencia
+
+services:
+  web:
+    image: ${FUSEAGENCIA_WEB_IMAGE:?defina FUSEAGENCIA_WEB_IMAGE em images.env}
+    container_name: fuseagencia-web
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3700:80"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
