@@ -46,7 +46,7 @@
     <a href="#inicio" class="brand" aria-label="FUSE Agência - início">
       <img src="assets/img/logo-horizontal.webp" alt="FUSE Agência" width="140" height="46">
     </a>
-    <nav class="menu" aria-label="Principal">
+    <nav class="menu" id="menu" aria-label="Principal">
       <a href="#inicio" class="active">Início</a>
       <a href="#sobre">Sobre</a>
       <a href="#servicos">Serviços</a>
@@ -54,6 +54,7 @@
       <a href="#contato">Contato</a>
     </nav>
     <a href="#contato" class="btn btn-outline btn-sm">Fale com a gente <span aria-hidden="true">→</span></a>
+    <button class="nav-toggle" type="button" aria-label="Abrir menu" aria-expanded="false" aria-controls="menu"><span></span></button>
   </div>
 </header>
 
@@ -180,6 +181,19 @@
   </div>
 </footer>
 
-<script>document.getElementById('y').textContent = new Date().getFullYear();</script>
+<script>
+  document.getElementById('y').textContent = new Date().getFullYear();
+  (function () {
+    var header = document.querySelector('.site-header');
+    var toggle = header.querySelector('.nav-toggle');
+    function setOpen(open) {
+      header.classList.toggle('menu-open', open);
+      toggle.setAttribute('aria-expanded', open);
+      toggle.setAttribute('aria-label', open ? 'Fechar menu' : 'Abrir menu');
+    }
+    toggle.addEventListener('click', function () { setOpen(!header.classList.contains('menu-open')); });
+    header.querySelectorAll('.menu a').forEach(function (a) { a.addEventListener('click', function () { setOpen(false); }); });
+  })();
+</script>
 </body>
 </html>
