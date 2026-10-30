@@ -446,3 +446,13 @@ h1, h2, h3 { line-height: 1.08; margin: 0 0 .5em; letter-spacing: -.02em; }
   .cta-art { height: 360px; }
   .cta-art .d { top: 16px; height: 185%; }
 }
+
+/* Ícones Lucide (lucide.dev, licença ISC) */
+.lucide { display: block; flex-shrink: 0; }
+.hero-points { flex-wrap: nowrap; gap: 1.6rem; }
+.hero-points .pt { display: flex; flex-direction: column; font-weight: 600; }
+.hero-points .pt small { font-weight: 400; }
+@media (max-width: 860px) {
+  .hero-points { gap: .5rem; }
+  .hero-points .pt { align-items: center; }
+}
